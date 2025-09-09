@@ -1,4 +1,5 @@
 streamlit
-streamlit-geolocation
+requests
 pydeck
+streamlit-geolocation
 pandas
