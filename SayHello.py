@@ -1,1 +1,1 @@
-print("hello world")
+st.write("# Welcome to Streamlit! 👋")
