@@ -1,45 +1,37 @@
-# app.py — Taiwan bus nearby checker (Streamlit)
+# app.py — Streamlit app to show a map and moving cars on roads (simulated with OpenStreetMap)
 #
-# Requirements (install locally):
-#   pip install streamlit requests streamlit-geolocation pydeck
+# Why simulated? Live per-car tracking data is generally private/unavailable. This app pulls nearby
+# road geometry from OpenStreetMap (via Overpass API) and animates virtual “cars” moving along those roads.
 #
-# How to run:
-#   1) Get a TDX (MOTC) Client ID and Client Secret from https://tdx.transportdata.tw/
-#   2) Set env vars (recommended):
-#        export TDX_CLIENT_ID="your_id"
-#        export TDX_CLIENT_SECRET="your_secret"
-#      or enter them in the sidebar fields when launching the app.
-#   3) streamlit run app.py
+# Requirements:
+#   pip install streamlit requests pydeck streamlit-geolocation numpy
 #
-# What it does:
-#   • Gets your browser location (with permission)
-#   • Queries nearby bus stops from TDX
-#   • Shows real‑time ETAs for those stops
-#   • (Optional) Shows live bus vehicles within a radius
+# Run:
+#   streamlit run app.py
 #
-# Notes:
-#   • Your location is only used inside your browser session.
-#   • If you’re on a corporate/VPN network, geolocation might be blocked.
+# Tips:
+#   • Click the geolocation button to center the map.
+#   • Use the sidebar to choose radius, number of cars, and refresh rate.
+#   • (Optional) If you have a Mapbox token, set MAPBOX_API_KEY env var for nicer basemaps.
 
 from __future__ import annotations
-import os
-import time
 import math
-import urllib.parse
-from typing import Dict, List, Any, Optional
+import time
+import random
+from typing import List, Dict, Any, Tuple
 
 import requests
+import numpy as np
 import pandas as pd
 import streamlit as st
 import pydeck as pdk
 from streamlit_geolocation import streamlit_geolocation
 
 # ---------------------------
-# Helpers
+# Geometry helpers
 # ---------------------------
 
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Return distance in meters between (lat1, lon1) and (lat2, lon2)."""
     R = 6371000.0
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
@@ -47,238 +39,200 @@ def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     a = math.sin(dphi/2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda/2) ** 2
     return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
-# Basic mapping of TDX City IDs commonly used for city buses
-TDX_CITY_IDS = [
-    "Keelung", "Taipei", "NewTaipei", "Taoyuan", "Hsinchu", "HsinchuCounty",
-    "MiaoliCounty", "Taichung", "ChanghuaCounty", "NantouCounty", "YunlinCounty",
-    "Chiayi", "ChiayiCounty", "Tainan", "Kaohsiung", "PingtungCounty",
-    "YilanCounty", "HualienCounty", "TaitungCounty", "PenghuCounty", "KinmenCounty"
-]
+def polyline_length_m(coords: List[Tuple[float, float]]) -> float:
+    return sum(haversine(coords[i][1], coords[i][0], coords[i+1][1], coords[i+1][0]) for i in range(len(coords)-1))
 
-TOKEN_URL = "https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token"
-API_BASE = "https://tdx.transportdata.tw/api/basic/v2"
+def cumulative_distances(coords: List[Tuple[float, float]]) -> List[float]:
+    dists = [0.0]
+    for i in range(len(coords)-1):
+        dists.append(dists[-1] + haversine(coords[i][1], coords[i][0], coords[i+1][1], coords[i+1][0]))
+    return dists
 
-@st.cache_data(show_spinner=False)
-def get_access_token(client_id: str, client_secret: str) -> str:
-    """Fetch OAuth2 access token from TDX using client_credentials."""
-    data = {
-        "grant_type": "client_credentials",
-        "client_id": client_id,
-        "client_secret": client_secret,
-    }
-    headers = {"content-type": "application/x-www-form-urlencoded"}
-    r = requests.post(TOKEN_URL, data=data, headers=headers, timeout=20)
+def interpolate_along(coords: List[Tuple[float, float]], cumd: List[float], s: float) -> Tuple[float, float]:
+    """Given polyline coords [(lon,lat)...], cumulative distances 'cumd', return point at distance s."""
+    if s <= 0:
+        return coords[0][0], coords[0][1]
+    if s >= cumd[-1]:
+        return coords[-1][0], coords[-1][1]
+    # find segment
+    for i in range(len(cumd)-1):
+        if cumd[i] <= s <= cumd[i+1]:
+            t = (s - cumd[i]) / (cumd[i+1] - cumd[i] + 1e-9)
+            lon = coords[i][0] + t * (coords[i+1][0] - coords[i][0])
+            lat = coords[i][1] + t * (coords[i+1][1] - coords[i][1])
+            return lon, lat
+    return coords[-1][0], coords[-1][1]
+
+# ---------------------------
+# Overpass (OSM) fetch
+# ---------------------------
+
+def fetch_roads(lat: float, lon: float, radius_m: int = 1000) -> List[Dict[str, Any]]:
+    """Fetch road polylines around a point using Overpass API."""
+    # Highways to include (exclude footways/paths by default)
+    hw = ["motorway","trunk","primary","secondary","tertiary","unclassified","residential","service"]
+    hw_q = "|".join(hw)
+    query = f"""
+    [out:json][timeout:25];
+    way["highway"~"{hw_q}"](around:{radius_m},{lat},{lon});
+    (._;>;); out geom;
+    """
+    r = requests.post("https://overpass-api.de/api/interpreter", data=query, timeout=30)
     r.raise_for_status()
-    return r.json()["access_token"]
+    data = r.json()
+    # Build ways with geometry
+    roads = []
+    for el in data.get("elements", []):
+        if el.get("type") == "way" and "geometry" in el:
+            coords = [(pt["lon"], pt["lat"]) for pt in el["geometry"]]
+            if len(coords) >= 2:
+                L = polyline_length_m(coords)
+                if L >= 60:  # ignore tiny service stubs
+                    roads.append({
+                        "id": el.get("id"),
+                        "name": (el.get("tags") or {}).get("name", "(unnamed)"),
+                        "highway": (el.get("tags") or {}).get("highway", ""),
+                        "coords": coords,
+                        "length_m": L,
+                    })
+    return roads
 
-class TDX:
-    def __init__(self, token: str):
-        self.token = token
-        self.session = requests.Session()
-        self.session.headers.update({"Authorization": f"Bearer {token}", "Accept": "application/json"})
+# ---------------------------
+# Simulation model
+# ---------------------------
 
-    def get(self, url: str, **kwargs) -> Any:
-        r = self.session.get(url, timeout=20, **kwargs)
-        r.raise_for_status()
-        return r.json()
+def seed_cars(roads: List[Dict[str, Any]], n: int, speed_kmh_range=(20, 70)) -> List[Dict[str, Any]]:
+    """Create n cars assigned to random roads with random speeds and start offsets."""
+    if not roads:
+        return []
+    cars = []
+    for i in range(n):
+        road = random.choice(roads)
+        # Precompute cumulative distances for the chosen road
+        cumd = cumulative_distances(road["coords"])  # meters
+        total = cumd[-1]
+        speed = random.uniform(*speed_kmh_range) * 1000/3600  # m/s
+        start_offset = random.uniform(0, total)  # position along the road at t=0
+        direction = random.choice([1, -1])
+        cars.append({
+            "car_id": f"car_{i+1}",
+            "road_id": road["id"],
+            "road_name": road["name"],
+            "coords": road["coords"],
+            "cumd": cumd,
+            "total": total,
+            "speed_mps": speed,
+            "pos0": start_offset,
+            "dir": direction,
+        })
+    return cars
 
-    # Nearby stops using $spatialFilter
-    def nearby_stops(self, city: str, lat: float, lon: float, radius_m: int = 300) -> List[Dict[str, Any]]:
-        spatial = f"$spatialFilter=nearby(StopPosition,{lat},{lon},{radius_m})"
-        url = f"{API_BASE}/Bus/Stop/City/{urllib.parse.quote(city)}?{spatial}&$format=JSON"
-        return self.get(url)
-
-    # ETA for a set of StopUIDs
-    def eta_for_stops(self, city: str, stop_uids: List[str]) -> List[Dict[str, Any]]:
-        if not stop_uids:
-            return []
-        # Build OData filter: StopUID eq 'A' or StopUID eq 'B' ...
-        ors = " or ".join([f"StopUID eq '{uid}'" for uid in stop_uids])
-        filt = f"$filter={urllib.parse.quote(ors)}"
-        url = f"{API_BASE}/Bus/EstimatedTimeOfArrival/City/{urllib.parse.quote(city)}?{filt}&$orderby=StopUID,StopSequence&$format=JSON"
-        return self.get(url)
-
-    # Live vehicle positions (can be large). We filter by bounding circle client-side.
-    def realtime_by_city(self, city: str) -> List[Dict[str, Any]]:
-        url = f"{API_BASE}/Bus/RealTimeByFrequency/City/{urllib.parse.quote(city)}?$format=JSON"
-        return self.get(url)
+def advance_car(car: Dict[str, Any], dt: float) -> Tuple[float, float]:
+    """Compute current lon,lat after dt seconds since t0 (looping at ends)."""
+    s = (car["pos0"] + car["dir"] * car["speed_mps"] * dt) % car["total"]
+    lon, lat = interpolate_along(car["coords"], car["cumd"], s)
+    return lon, lat
 
 # ---------------------------
 # UI
 # ---------------------------
 
-st.set_page_config(page_title="Taiwan Bus Nearby (TDX)", page_icon="🚌", layout="wide")
+st.set_page_config(page_title="Road Car Movement (OSM simulated)", page_icon="🚗", layout="wide")
 
-st.title("🚌 Taiwan Bus Nearby")
-st.caption("Find buses near you in Taiwan using TDX real‑time data.")
+st.title("🚗 Live-looking Car Movement on Roads (Simulated)")
+st.caption("Animates virtual cars along nearby OpenStreetMap roads. Great for demos and dashboards.")
 
 with st.sidebar:
-    st.header("Settings")
-    default_id = os.environ.get("TDX_CLIENT_ID", "")
-    default_secret = os.environ.get("TDX_CLIENT_SECRET", "")
-    cid = st.text_input("TDX Client ID", value=default_id, type="default")
-    csecret = st.text_input("TDX Client Secret", value=default_secret, type="password")
-    city = st.selectbox("City (TDX ID)", options=TDX_CITY_IDS, index=TDX_CITY_IDS.index("Taipei"))
-    radius_m = st.slider("Search radius (meters)", min_value=50, max_value=1500, value=300, step=50)
-    eta_soon_min = st.slider("Consider 'near' if arriving within (minutes)", min_value=1, max_value=20, value=6)
-    refresh_sec = st.slider("Auto-refresh (seconds)", min_value=0, max_value=60, value=15, help="0 = no auto refresh")
-    show_live = st.checkbox("Show live vehicles layer (experimental)", value=False)
+    st.header("Controls")
+    radius_m = st.slider("Road search radius (m)", 200, 3000, 1200, step=100)
+    n_cars = st.slider("Number of cars", 5, 200, 50, step=5)
+    speed_min = st.slider("Min speed (km/h)", 5, 80, 20)
+    speed_max = st.slider("Max speed (km/h)", 10, 120, 70)
+    refresh_sec = st.slider("Refresh interval (s)", 0, 5, 1)
+    show_roads = st.checkbox("Show road paths", True)
 
-if not cid or not csecret:
-    st.info("Enter your TDX Client ID/Secret in the sidebar to start.")
-    st.stop()
-
-# Ask for geolocation (user clicks the button)
 loc = streamlit_geolocation()
-if not isinstance(loc, dict) or "latitude" not in loc or loc.get("latitude") is None:
-    st.warning("Click the geolocation button above to share your location.")
+if not isinstance(loc, dict) or loc.get("latitude") is None:
+    st.info("Click the geolocation button above to share your location.")
     st.stop()
 
-user_lat = float(loc["latitude"])  # type: ignore
-user_lon = float(loc["longitude"])  # type: ignore
-st.success(f"Your location: lat {user_lat:.5f}, lon {user_lon:.5f}")
+lat0 = float(loc["latitude"])  # type: ignore
+lon0 = float(loc["longitude"])  # type: ignore
+st.success(f"Map centered at lat {lat0:.5f}, lon {lon0:.5f}")
 
-# Token and client
-try:
-    token = get_access_token(cid, csecret)
-except Exception as e:
-    st.error(f"Failed to get TDX access token: {e}")
+# Cache roads by center+radius to avoid hammering Overpass
+@st.cache_data(show_spinner=False)
+def load_roads_cached(lat: float, lon: float, radius: int):
+    roads = fetch_roads(lat, lon, radius)
+    # Build DataFrame for PathLayer
+    df_roads = pd.DataFrame({
+        "id": [r["id"] for r in roads],
+        "name": [r["name"] for r in roads],
+        "highway": [r["highway"] for r in roads],
+        "path": [r["coords"] for r in roads],
+        "length_m": [r["length_m"] for r in roads],
+    })
+    return roads, df_roads
+
+with st.spinner("Loading nearby roads from OpenStreetMap…"):
+    roads, df_roads = load_roads_cached(lat0, lon0, radius_m)
+
+if not roads:
+    st.warning("No roads found. Try increasing radius.")
     st.stop()
 
-tdx = TDX(token)
+# Initialize cars once per parameter set
+if "cars" not in st.session_state or st.session_state.get("cars_params") != (len(roads), n_cars, speed_min, speed_max):
+    st.session_state["cars"] = seed_cars(roads, n_cars, (speed_min, speed_max))
+    st.session_state["t0"] = time.time()
+    st.session_state["cars_params"] = (len(roads), n_cars, speed_min, speed_max)
 
-# Fetch nearby stops
-with st.spinner("Finding nearby stops…"):
-    stops = tdx.nearby_stops(city, user_lat, user_lon, radius_m)
+cars = st.session_state["cars"]
+t0 = st.session_state["t0"]
 
-if not stops:
-    st.info("No stops found within the selected radius. Try a larger radius or switch city.")
-    st.stop()
-
-stops_df_rows = []
-for s in stops:
-    pos = s.get("StopPosition", {})
-    lat, lon = pos.get("PositionLat"), pos.get("PositionLon")
-    stops_df_rows.append({
-        "StopUID": s.get("StopUID"),
-        "StopID": s.get("StopID"),
-        "StopName": s.get("StopName", {}).get("Zh_tw") or s.get("StopName", {}).get("En"),
-        "Lat": lat,
-        "Lon": lon,
-        "Distance_m": round(haversine(user_lat, user_lon, lat, lon), 1) if lat and lon else None,
+# Compute car positions based on elapsed time
+now = time.time()
+DT = now - t0
+car_positions = []
+for c in cars:
+    lon, lat = advance_car(c, DT)
+    car_positions.append({
+        "car_id": c["car_id"],
+        "road": c["road_name"],
+        "lon": lon,
+        "lat": lat,
+        "speed_kmh": round(c["speed_mps"] * 3.6, 1),
     })
 
-stops_df = pd.DataFrame(stops_df_rows).sort_values("Distance_m")
+cars_df = pd.DataFrame(car_positions)
 
-# Get ETAs for these stops
-etas = tdx.eta_for_stops(city, stops_df["StopUID"].dropna().astype(str).tolist())
+# Layers
+layers = []
+if show_roads:
+    layers.append(pdk.Layer(
+        "PathLayer",
+        data=df_roads,
+        get_path="path",
+        width_scale=1,
+        width_min_pixels=1,
+        get_width=2,
+        pickable=True,
+    ))
 
-eta_rows = []
-for e in etas:
-    # EstimateTime: seconds to arrival (may be missing)
-    est_sec = e.get("EstimateTime")
-    stop_uid = e.get("StopUID")
-    route = e.get("RouteName", {}).get("Zh_tw") or e.get("RouteName", {}).get("En")
-    direction = e.get("Direction")  # 0=去程, 1=返程
-    stop_seq = e.get("StopSequence")
-    is_last = e.get("IsLastBus")
-    status = e.get("StopStatus")  # 0=正常, others per spec
-    eta_rows.append({
-        "StopUID": stop_uid,
-        "Route": route,
-        "Direction": direction,
-        "StopSequence": stop_seq,
-        "ETA_min": None if est_sec is None else round(est_sec/60, 1),
-        "IsLastBus": is_last,
-        "StopStatus": status,
-    })
-
-eta_df = pd.DataFrame(eta_rows)
-
-# Merge ETA with stops for display
-merged = stops_df.merge(eta_df, on="StopUID", how="left")
-merged = merged.sort_values(["Distance_m", "Route", "StopSequence"])  # nearest first
-
-# Determine "any bus near me" based on ETA threshold
-near_mask = (merged["ETA_min"].notna()) & (merged["ETA_min"] <= eta_soon_min)
-any_near = bool(near_mask.any())
-
-st.subheader("Result")
-if any_near:
-    st.success(f"✅ Yes — at least one bus is arriving within {eta_soon_min} minutes.")
-else:
-    st.info(f"ℹ️ No bus ETA within {eta_soon_min} minutes at the nearby stops.")
-
-# Table
-st.subheader("Nearby stops & ETAs")
-st.dataframe(
-    merged[["StopName", "Distance_m", "Route", "Direction", "StopSequence", "ETA_min", "IsLastBus", "StopStatus"]]
-)
-
-# Map visualization with pydeck
-st.subheader("Map")
-stop_layer = pdk.Layer(
+layers.append(pdk.Layer(
     "ScatterplotLayer",
-    data=stops_df,
-    get_position='[Lon, Lat]',
-    get_radius=20,
+    data=cars_df,
+    get_position='[lon, lat]',
+    get_radius=25,
     pickable=True,
-)
-user_layer = pdk.Layer(
-    "ScatterplotLayer",
-    data=pd.DataFrame({"Lat": [user_lat], "Lon": [user_lon]}),
-    get_position='[Lon, Lat]',
-    get_radius=60,
-    pickable=False,
-)
+))
 
-layers = [stop_layer, user_layer]
+view = pdk.ViewState(latitude=lat0, longitude=lon0, zoom=14)
+st.pydeck_chart(pdk.Deck(map_style=None, initial_view_state=view, layers=layers, tooltip={"text": "{car_id}\n{road}\n{speed_kmh} km/h"}))
 
-# Optional: live vehicles around user (rough filter by distance)
-if show_live:
-    with st.spinner("Loading live vehicle positions…"):
-        try:
-            vehicles = tdx.realtime_by_city(city)
-        except Exception as e:
-            st.error(f"Failed to get live vehicle positions: {e}")
-            vehicles = []
-    v_rows = []
-    for v in vehicles:
-        bus_pos = v.get("BusPosition") or {}
-        lat = bus_pos.get("PositionLat")
-        lon = bus_pos.get("PositionLon")
-        if lat is None or lon is None:
-            continue
-        dist = haversine(user_lat, user_lon, lat, lon)
-        if dist <= max(1000, radius_m):  # show within 1km or chosen radius
-            v_rows.append({
-                "Lat": lat,
-                "Lon": lon,
-                "Distance_m": round(dist, 1),
-                "Route": (v.get("RouteName") or {}).get("Zh_tw") or (v.get("RouteName") or {}).get("En"),
-                "Plate": v.get("PlateNumb"),
-            })
-    if v_rows:
-        v_df = pd.DataFrame(v_rows)
-        st.caption(f"Live vehicles within ~{max(1000, radius_m)} m: {len(v_df)}")
-        vehicle_layer = pdk.Layer(
-            "ScatterplotLayer",
-            data=v_df,
-            get_position='[Lon, Lat]',
-            get_radius=40,
-            pickable=True,
-        )
-        layers.append(vehicle_layer)
-        with st.expander("See live vehicle list"):
-            st.dataframe(v_df.sort_values("Distance_m"))
-    else:
-        st.caption("No live vehicles within the radius right now.")
+with st.expander("Car list"):
+    st.dataframe(cars_df)
 
-view_state = pdk.ViewState(latitude=user_lat, longitude=user_lon, zoom=15)
-st.pydeck_chart(pdk.Deck(map_style=None, initial_view_state=view_state, layers=layers, tooltip={"text": "{Route}\n{Plate}\n{Distance_m} m"}))
-
-# Auto-refresh
 if refresh_sec > 0:
-    st.caption(f"Auto‑refreshing every {refresh_sec}s… (disable in sidebar)")
     time.sleep(refresh_sec)
     st.rerun()
