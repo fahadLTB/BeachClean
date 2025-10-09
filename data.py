@@ -26,6 +26,14 @@ st.set_page_config(page_title="Student Info Portal", page_icon="🎓", layout="w
 # Helpers: Auth
 # =============================
 
+def safe_rerun():
+    """Compatibility wrapper for Streamlit rerun across versions."""
+    if hasattr(st, "rerun"):
+        st.rerun()
+    else:  # Backward compatibility for older Streamlit
+        safe_rerun()
+
+
 def hash_password(password: str, salt: str | None = None) -> tuple[str, str]:
     """Return (salt, hash). If salt not provided, a new one is generated."""
     if salt is None:
@@ -248,7 +256,7 @@ def login_form():
                 "name": user["name"],
                 "role": user["role"],
             }
-            st.experimental_rerun()
+            safe_rerun()
         else:
             st.error("Invalid email or password")
 
@@ -284,7 +292,7 @@ def ensure_logged_in():
 def logout_button():
     if st.sidebar.button("Logout"):
         st.session_state.pop("auth_user", None)
-        st.experimental_rerun()
+        safe_rerun()
 
 
 # =============================
@@ -387,7 +395,7 @@ def admin_dashboard(user):
             ok = delete_student(del_email.strip().lower())
             if ok:
                 st.success("Student deleted")
-                st.experimental_rerun()
+                safe_rerun()
             else:
                 st.error("Student not found")
         else:
