@@ -21,6 +21,9 @@ ADMIN_NAME = os.getenv("ADMIN_NAME", "School Admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")  # Change in production!
 
 st.set_page_config(page_title="Student Info Portal", page_icon="🎓", layout="wide")
+st.write("Current working directory:", os.getcwd())
+st.write("Files in this folder:", os.listdir())
+
 
 # =============================
 # Helpers: Auth
