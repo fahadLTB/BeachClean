@@ -3,4 +3,3 @@ requests
 pydeck
 streamlit-geolocation
 pandas
-pygment
